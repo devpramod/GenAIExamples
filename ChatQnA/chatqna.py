@@ -5,8 +5,10 @@ import argparse
 import json
 import os
 import re
+import time
 
 from comps import MegaServiceEndpoint, MicroService, ServiceOrchestrator, ServiceRoleType, ServiceType
+from comps.cores.mega.orchestrator import ConversationMetrics
 from comps.cores.mega.utils import handle_message
 from comps.cores.proto.api_protocol import (
     ChatCompletionRequest,
@@ -164,6 +166,9 @@ def align_outputs(self, data, cur_node, inputs, runtime_graph, llm_parameters_di
             next_data = data
         else:
             next_data["text"] = data["choices"][0]["message"]["content"]
+            # Pass through metrics if they exist in the data
+            if "metrics" in data:
+                next_data["metrics"] = data["metrics"]
     else:
         next_data = data
 
@@ -173,6 +178,12 @@ def align_outputs(self, data, cur_node, inputs, runtime_graph, llm_parameters_di
 def align_generator(self, gen, **kwargs):
     # OpenAI response format
     # b'data:{"id":"","object":"text_completion","created":1725530204,"model":"meta-llama/Meta-Llama-3-8B-Instruct","system_fingerprint":"2.0.1-native","choices":[{"index":0,"delta":{"role":"assistant","content":"?"},"logprobs":null,"finish_reason":null}]}\n\n'
+    
+    # Initialize metrics tracking variables
+    conversation_metrics = kwargs.get("conversation_metrics", None)
+    input_text = kwargs.get("input_text", "")
+    full_content = ""
+    
     for line in gen:
         line = line.decode("utf-8")
         start = line.find("{")
@@ -191,9 +202,23 @@ def align_generator(self, gen, **kwargs):
                 json_data["choices"][0]["finish_reason"] != "eos_token"
                 and "content" in json_data["choices"][0]["delta"]
             ):
-                yield f"data: {repr(json_data['choices'][0]['delta']['content'].encode('utf-8'))}\n\n"
+                content = json_data["choices"][0]["delta"]["content"]
+                # Track content for metrics
+                if conversation_metrics:
+                    full_content += content
+                yield f"data: {repr(content.encode('utf-8'))}\n\n"
         except Exception as e:
             yield f"data: {repr(json_str.encode('utf-8'))}\n\n"
+    
+    # Calculate and inject metrics before [DONE] if metrics are enabled
+    if conversation_metrics and full_content:
+        conversation_metrics.add_content(full_content)
+        metrics = conversation_metrics.calculate_metrics(input_text)
+        if metrics:
+            # Yield metrics as a separate data chunk before [DONE]
+            metrics_json = json.dumps(metrics)
+            yield f"data: {{\"metrics\": {metrics_json}}}\n\n"
+    
     yield "data: [DONE]\n\n"
 
 
